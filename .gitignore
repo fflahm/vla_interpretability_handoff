@@ -4,23 +4,7 @@ __pycache__/
 
 .venv/
 *.egg-info/
+.pytest_cache/
 
-outputs/.cache/
-outputs/.mplconfig/
-outputs/states/images/
-outputs/states/*.jsonl
-outputs/activations/*.npz
-outputs/probes/*.csv
-outputs/probes/*.json
-outputs/probes/*.joblib
-outputs/figures/*.png
-outputs/static_eval/*.jsonl
-outputs/static_eval/*.npz
-outputs/static_eval/*.csv
-outputs/static_eval/*.json
-outputs/static_eval_*/*.csv
-outputs/static_eval_*/*.json
-outputs/static_eval_*/*.jsonl
-outputs/static_eval_*/*.npz
-outputs/static_openvla*/
-outputs/rollouts/
+# All experiment artifacts stay local. Never commit run data.
+/outputs/

@@ -108,7 +108,12 @@ class Pi05Wrapper(ModelWrapper):
         self.num_predictions = 0
         config = PreTrainedConfig.from_pretrained(model_id)
         config.compile_model = False
-        self.policy = PI05Policy.from_pretrained(model_id, config=config).to(self.device_obj).eval()
+        # LeRobot's PI0.5 port may report the tied language embedding as missing
+        # even though its shared checkpoint tensor is loaded. Strict loading
+        # aborts the entire load in that case and silently returns random weights.
+        self.policy = PI05Policy.from_pretrained(
+            model_id, config=config, strict=False
+        ).to(self.device_obj).eval()
         self.preprocess, self.postprocess = make_pre_post_processors(
             self.policy.config,
             model_id,
@@ -155,7 +160,9 @@ class Pi05Wrapper(ModelWrapper):
         # Raw LIBERO simulator frames are rotated relative to the dataset convention.
         image_uint8 = np.flip(image.astype(np.uint8), axis=(0, 1)).copy()
         wrist_image = image_uint8
-        if metadata is not None and metadata.get("wrist_image_path"):
+        if metadata is not None and metadata.get("wrist_image") is not None:
+            wrist_image = np.flip(np.asarray(metadata["wrist_image"], dtype=np.uint8), axis=(0, 1)).copy()
+        elif metadata is not None and metadata.get("wrist_image_path"):
             wrist_image = np.flip(load_image_np(metadata["wrist_image_path"]).astype(np.uint8), axis=(0, 1)).copy()
         return {
             # PI0.5 base preprocessing pads the state before device processing,

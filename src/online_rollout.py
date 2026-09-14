@@ -5,6 +5,7 @@ import json
 import shutil
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,18 @@ from .utils import ensure_dir
 
 DEFAULT_RENAME_MAP = {"observation.images.image2": "observation.images.wrist_image"}
 POOLING_MODES = ("mean", "last", "flatten")
+
+
+@dataclass(frozen=True)
+class Pi05ActivationIntervention:
+    """Intervene on one PI0.5 tower's local layer and equal-width token bin."""
+
+    tower: str
+    layer_index: int
+    token_bin_index: int
+    token_bins: int = 96
+    mode: str = "zero"
+    scale: float = 0.0
 
 
 class Pi05LiberoRolloutTracer:
@@ -36,6 +49,7 @@ class Pi05LiberoRolloutTracer:
         rename_map: dict[str, str] | None = None,
         pooling: str = "mean",
         rotate_images_180: bool = True,
+        intervention: Pi05ActivationIntervention | None = None,
     ) -> None:
         try:
             import torch
@@ -78,6 +92,7 @@ class Pi05LiberoRolloutTracer:
         self.fallback_instruction = instruction
         self.preprocess_observation = preprocess_observation
         self.rotate_images_180 = rotate_images_180
+        self.intervention = intervention
 
         cfg_kwargs = {"task": task, "task_ids": [task_id], "max_parallel_tasks": 1}
         signature = inspect.signature(LeRobotLiberoConfig)
@@ -86,7 +101,12 @@ class Pi05LiberoRolloutTracer:
 
         config = PreTrainedConfig.from_pretrained(checkpoint_path)
         config.compile_model = False
-        self.policy = PI05Policy.from_pretrained(checkpoint_path, config=config).to(self.device).eval()
+        # The PI0.5 checkpoint ties the language embedding; strict loading can
+        # report that shared tensor as missing and leave a randomly initialized
+        # policy in some LeRobot versions. Match the validated offline wrapper.
+        self.policy = PI05Policy.from_pretrained(
+            checkpoint_path, config=config, strict=False
+        ).to(self.device).eval()
         rename_map = dict(rename_map or DEFAULT_RENAME_MAP)
         self.preprocess, self.postprocess = make_pre_post_processors(
             self.policy.config,
@@ -146,6 +166,7 @@ class Pi05LiberoRolloutTracer:
             "num_episodes": len(summaries),
             "num_successes": int(sum(bool(item["success"]) for item in summaries)),
             "success_rate": float(np.mean([bool(item["success"]) for item in summaries])),
+            "intervention": _pi05_intervention_to_dict(self.intervention),
             "episodes": summaries,
         }
         with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -336,7 +357,13 @@ class Pi05LiberoRolloutTracer:
         def save_hook(name: str):
             def hook(_module: Any, _inputs: Any, output: Any) -> None:
                 tensor = output[0] if isinstance(output, tuple) else output
-                hidden[name] = tensor.detach() if hasattr(tensor, "detach") else tensor
+                modified = _apply_pi05_activation_intervention(tensor, name, self.intervention)
+                hidden[name] = modified.detach() if hasattr(modified, "detach") else modified
+                if modified is tensor:
+                    return None
+                if isinstance(output, tuple):
+                    return (modified, *output[1:])
+                return modified
 
             return hook
 
@@ -347,6 +374,58 @@ class Pi05LiberoRolloutTracer:
         finally:
             for handle in handles:
                 handle.remove()
+
+
+def _apply_pi05_activation_intervention(
+    tensor: Any,
+    layer_name: str,
+    intervention: Pi05ActivationIntervention | None,
+) -> Any:
+    if intervention is None or not hasattr(tensor, "clone"):
+        return tensor
+    expected_name = f"{intervention.tower}_layer_{int(intervention.layer_index):02d}"
+    if layer_name != expected_name:
+        return tensor
+    if intervention.tower not in ("paligemma", "expert"):
+        raise ValueError(f"Unsupported PI0.5 tower `{intervention.tower}`.")
+    if intervention.mode not in ("zero", "scale"):
+        raise ValueError(f"Unsupported intervention mode `{intervention.mode}`.")
+    if intervention.token_bins <= 0:
+        raise ValueError("`token_bins` must be positive.")
+    if tensor.ndim < 2:
+        return tensor
+    modified = tensor.clone()
+    seq_dim = 1 if modified.ndim >= 3 else 0
+    seq_len = int(modified.shape[seq_dim])
+    effective_bins = min(int(intervention.token_bins), seq_len)
+    if not 0 <= int(intervention.token_bin_index) < effective_bins:
+        raise ValueError(
+            f"Bin {intervention.token_bin_index} is unavailable for {layer_name}: "
+            f"sequence length {seq_len}, effective bins {effective_bins}."
+        )
+    edges = np.linspace(0, seq_len, effective_bins + 1, dtype=int)
+    start = int(edges[int(intervention.token_bin_index)])
+    end = int(edges[int(intervention.token_bin_index) + 1])
+    index = [slice(None)] * modified.ndim
+    index[seq_dim] = slice(start, end)
+    if intervention.mode == "zero":
+        modified[tuple(index)] = 0
+    else:
+        modified[tuple(index)] *= float(intervention.scale)
+    return modified
+
+
+def _pi05_intervention_to_dict(intervention: Pi05ActivationIntervention | None) -> dict[str, Any] | None:
+    if intervention is None:
+        return None
+    return {
+        "tower": intervention.tower,
+        "layer_index": int(intervention.layer_index),
+        "token_bin_index": int(intervention.token_bin_index),
+        "token_bins": int(intervention.token_bins),
+        "mode": intervention.mode,
+        "scale": float(intervention.scale),
+    }
 
 
 def _unwrap_single_env(env: Any) -> Any:

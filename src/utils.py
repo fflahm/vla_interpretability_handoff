@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,11 @@ def resolve_path(path: str | Path, root: Path | None = None) -> Path:
 def load_config(config_path: str | Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def log(message: str) -> None:
+    """Timestamped stdout line for long-running experiment monitoring."""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
 def ensure_dir(path: str | Path) -> Path:

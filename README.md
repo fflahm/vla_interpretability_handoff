@@ -1,34 +1,43 @@
-# VLA Interpretability Handoff
+# VLA Interpretability
 
-This repository is a compact handoff version of the VLA interpretability project. It keeps only three reproducible demos:
+Code for reading and intervening on PI0 / PI0.5 hidden states on LIBERO. The repository is organized as six experiment blocks. Library code lives in `src/`; each block has its own CLI under `scripts/<block>/`.
 
-1. **PI0.5 layerwise linear probing** on LIBERO states.
-2. **PI0 closed-loop rollout tracing** with rollout videos, full-token activations, rollout-time probes, and dashboard videos.
-3. **PI0 activation ablation sweep** over 36 layers and 96 token bins.
+```text
+scripts/
+  probe/              Demo 1 — PI0.5 layerwise linear probes on LIBERO states
+  pi0_rollout/        Demo 2 — PI0 closed-loop tracing, probes, dashboard video
+  pi0_ablation/       Demo 3 — PI0 layer × token-bin activation ablation
+  rich_annotations/   Auditable LIBERO demo/frame labels
+  occupancy/          PI0.5 3D self-occupancy decode, controls, CMI, NDS
+  pi05_ablation/      Probe-guided offline action-chunk ablation and frame stats
+```
 
-Static S2D evaluation scripts, OpenVLA analysis, and exploratory notebooks/results were intentionally removed from this handoff repo.
+Run artifacts belong in untracked `outputs/`. This repo does not ship HDF5, checkpoints, or experiment results.
 
-## Download
+```mermaid
+flowchart LR
+  probe[probe]
+  rollout[pi0_rollout]
+  pi0ab[pi0_ablation]
+  ann[rich_annotations]
+  occ[occupancy]
+  p5ab[pi05_ablation]
+  probe --> occ
+  ann --> occ
+  occ --> p5ab
+  rollout --> pi0ab
+```
 
-Clone the handoff repository:
+## Setup
 
 ```bash
 git clone https://github.com/bossxjh/vla_interpretability_handoff.git
 cd vla_interpretability_handoff
-```
-
-All generated artifacts are ignored by git and should be written under `outputs/` or a large cluster storage path.
-
-## Environment
-
-Use one full environment for all three demos. This environment can run real PI0 / PI0.5 + LIBERO jobs and also covers the downstream analysis scripts.
-
-```bash
 conda env create -f environment.yml
 conda activate vla-interpretability
 ```
 
-If `conda env create -f environment.yml` has trouble resolving the LeRobot git dependency, use the equivalent manual setup:
+If conda cannot resolve the LeRobot git dependency:
 
 ```bash
 conda create -y -n vla-interpretability python=3.10
@@ -38,36 +47,16 @@ python -m pip install -r requirements.txt
 python -m pip install "lerobot[pi,libero]@git+https://github.com/huggingface/lerobot.git"
 ```
 
-Real model and simulator runs require Linux + GPU + MuJoCo/EGL. On a headless cluster node, install or provide EGL/OpenGL runtime libraries:
+Real PI0 / PI0.5 + LIBERO jobs need Linux, a GPU, and MuJoCo/EGL:
 
 ```bash
 export MUJOCO_GL=egl
-sudo apt update
-sudo apt install -y libegl1 libopengl0 libgl1 mesa-utils
+export PYTHONNOUSERSITE=1
+export PI05_PATH=/path/to/pi05_libero
+export PI0_PATH=/path/to/pi0_libero
 ```
 
-If `sudo` is unavailable inside the job container, use an image that already contains these libraries.
-
-Quick check for the codebase:
-
-```bash
-python -m py_compile \
-  scripts/03_train_layerwise_probe.py \
-  scripts/05_plot_results.py \
-  scripts/18_plot_pi0_ablation_heatmaps.py
-```
-
-### Checkpoints and Optional Cache Settings
-
-The core code only requires checkpoint paths and normal MuJoCo/LeRobot environment variables. Set these for your own machine:
-
-```bash
-export MUJOCO_GL=egl
-export PI05_PATH=/path/to/pi05_libero_finetuned_snapshot_or_repo
-export PI0_PATH=/path/to/pi0_libero_finetuned_snapshot_or_repo
-```
-
-Optional cache variables, useful on clusters but not required:
+Optional caches:
 
 ```bash
 export HF_HOME=/path/to/huggingface_cache
@@ -76,19 +65,14 @@ export LIBERO_ASSETS_PATH=/path/to/libero/assets
 export HF_LEROBOT_HOME=/path/to/lerobot_dataset_cache
 ```
 
-If the checkpoints are not present locally, download them first or point `PI05_PATH` / `PI0_PATH` to the local snapshot directories. Use `HF_HUB_OFFLINE=1` only if the checkpoints are already available locally.
+On a machine that already matches the original layout, `source start.sh` sets `MUJOCO_GL`, checkpoint paths, and related defaults. Cluster cache helpers are in `scripts/setup_cluster_env.sh` and can be ignored off-cluster.
 
-For the original PJLab cluster layout used during development, `scripts/setup_cluster_env.sh` can be sourced after overriding `USER_ROOT`, `PI0_PATH`, and `PI05_PATH` as needed. If you are not on that cluster, you can ignore this helper.
-
-### Environment Smoke Tests
-
-Run these before launching long jobs:
+Smoke-check the environment:
 
 ```bash
 python - <<'PY'
 import torch
 print("torch", torch.__version__, "cuda", torch.cuda.is_available())
-from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi0 import PI0Policy
 from lerobot.policies.pi05 import PI05Policy
 from lerobot.envs.configs import LiberoEnv
@@ -96,99 +80,54 @@ print("lerobot pi/libero imports OK")
 PY
 ```
 
-Check LIBERO rendering:
+CPU-only unit tests (no GPU, no full LIBERO replay):
 
 ```bash
-python - <<'PY'
-import os
-print("MUJOCO_GL =", os.environ.get("MUJOCO_GL"))
-print("LIBERO_ASSETS_PATH =", os.environ.get("LIBERO_ASSETS_PATH"))
-PY
+PYTHONNOUSERSITE=1 python -m unittest discover -s tests
 ```
 
-## Demo 1: PI0.5 Layerwise Linear Probing
+## 1. Layerwise probing (`scripts/probe/`)
 
-**Goal.** Test whether PI0.5 hidden states linearly encode task-relevant visuomotor variables. The main figure is a multi-curve R2 plot, `Layerwise linear decodability across probe targets`, covering:
+**Goal.** Test whether PI0.5 hidden states linearly encode visuomotor variables. The main figure is a multi-curve R² plot over `offset`, `target_position`, `gripper_position`, `action`, `action_chunk`, and ground-truth action labels when present.
 
-- `offset`: target position minus gripper position.
-- `target_position`: absolute target object position.
-- `gripper_position`: absolute gripper/end-effector position.
-- `action`: model single-step action output.
-- `action_chunk`: flattened model action chunk target, when available.
-- `gt_action` and `gt_action_chunk`: ground-truth action labels, when present in the state file.
-
-**Experimental setting.** We sample LIBERO states from an early task phase, e.g. LIBERO-Spatial task 1. Each state stores RGB image, instruction, gripper position, target position, target offset, and optional ground-truth action labels. PI0.5 is run once per state. For every transformer layer, the sequence hidden state is mean-pooled over tokens into one layer-level representation. A ridge linear probe is then trained layer-by-layer.
-
-**Reproduce.**
-
-First collect or provide states:
+Each LIBERO state stores RGB, instruction, gripper/target positions, and optional GT actions. PI0.5 is run once per state. Every transformer layer is mean-pooled over tokens, then a ridge probe is trained layer by layer.
 
 ```bash
-python scripts/01_collect_states.py \
+python scripts/probe/collect_states.py \
   --config configs/demo.yaml \
   --env libero_dataset \
   --task libero_spatial \
   --task-id 1 \
   --num-samples 500
-```
 
-Extract PI0.5 activations:
-
-```bash
-python scripts/02_extract_activations.py \
+python scripts/probe/extract_activations.py \
   --config configs/demo.yaml \
   --model pi05 \
   --pi05-path "$PI05_PATH"
+
+python scripts/probe/train_layerwise_probe.py --config configs/demo.yaml --target all
+python scripts/probe/plot_results.py --config configs/demo.yaml --target all
 ```
 
-Train all probes and plot the combined R2 figure:
+Outputs: `outputs/activations/activations.npz`, `outputs/probes/layerwise_probe_*.csv`, `outputs/figures/layerwise_probe_targets_r2_comparison.png`.
+
+Activation smoke test:
 
 ```bash
-python scripts/03_train_layerwise_probe.py --config configs/demo.yaml --target all
-python scripts/05_plot_results.py --config configs/demo.yaml --target all
+python scripts/probe/extract_activations.py \
+  --config configs/demo.yaml --model pi05 --pi05-path "$PI05_PATH" --max-samples 10
 ```
 
-Expected outputs:
+## 2. PI0 closed-loop tracing (`scripts/pi0_rollout/`)
 
-```text
-outputs/activations/activations.npz
-outputs/probes/layerwise_probe_results*.csv
-outputs/probes/layerwise_probe_target_summary.csv
-outputs/figures/layerwise_probe_targets_r2_comparison.png
-```
+**Goal.** Record a PI0 LIBERO rollout (video, policy outputs, robot/object metadata, full-token activations), train rollout-time probes, and render a dashboard that aligns execution RGB, a layer×token activation heatmap, and a layer×probe-target error heatmap.
 
-For a smoke test:
-
-```bash
-python scripts/02_extract_activations.py --config configs/demo.yaml --model pi05 --pi05-path "$PI05_PATH" --max-samples 10
-```
-
-## Demo 2: PI0 Closed-Loop Rollout Tracing and Dynamic Dashboard
-
-**Goal.** Observe PI0 during an actual LIBERO closed-loop rollout. The demo saves the robot execution video, policy outputs, robot/object metadata, and full-token activations for every captured replan/step. A second analysis stage trains rollout-time probes and renders a dashboard video that aligns:
-
-- LIBERO execution image.
-- Layer x token-bin activation heatmap.
-- Layer x probe-target error heatmap.
-
-**Experimental setting.** The default task is LIBERO-Spatial task 1:
-
-```text
-pick up the black bowl from table center and place it on the plate
-```
-
-By default, the policy replans every environment step and saves all 36 layers of full-token activations in float16. This is IO-heavy, so for long rollouts write to a large GPFS/TOS path.
-
-**Collect rollouts.**
-
-Choose an output directory first:
+Default task: *pick up the black bowl from table center and place it on the plate*. By default the policy replans every environment step and writes all 36 layers of float16 tokens.
 
 ```bash
 export ROLLOUT_DIR="$PWD/outputs/rollouts/pi0_libero_spatial_task1_full_tokens_30interval"
-```
 
-```bash
-python scripts/09_collect_pi0_libero_rollouts.py \
+python scripts/pi0_rollout/collect.py \
   --config configs/demo.yaml \
   --pi0-path "$PI0_PATH" \
   --task libero_spatial \
@@ -203,48 +142,20 @@ python scripts/09_collect_pi0_libero_rollouts.py \
   --video-format mp4
 ```
 
-Useful variants:
+Useful flags: `--force-replan-every-step --replan-interval 1`, or `--no-save-activations` to cut IO.
 
 ```bash
-# Replan every step
---force-replan-every-step --replan-interval 1
-
-# Less IO, capture less often
---no-save-activations
-```
-
-Expected rollout structure:
-
-```text
-rollout_dir/
-  summary.json
-  token_layout.json
-  episode_000/
-    steps.jsonl
-    videos/*.mp4
-    activations/step_*/layer_*.npz
-```
-
-**Analyze rollout-time probes and candidate dynamic circuit edges.**
-
-```bash
-python scripts/13_analyze_pi0_dynamic_circuit.py \
+python scripts/pi0_rollout/analyze_dynamic_circuit.py \
   --config configs/demo.yaml \
   --rollout-dir "$ROLLOUT_DIR" \
   --pooling mean \
   --targets pickup_offset place_offset action policy_pred_action progress
 ```
 
-This writes a timestamped run under the corresponding `VLA-Probe-Analysis` directory.
-
-**Render dashboard video.**
-
-Set `ANALYSIS_DIR` to the timestamped directory printed by `scripts/13_analyze_pi0_dynamic_circuit.py`, for example `outputs/analysis/.../runs/20260626_120000_pool-mean_seed-42`.
+Set `ANALYSIS_DIR` to the timestamped run printed by that command, then:
 
 ```bash
-export ANALYSIS_DIR=/path/to/pi0_dynamic_analysis_run
-
-python scripts/14_render_pi0_dynamic_episode_video.py \
+python scripts/pi0_rollout/render_dashboard.py \
   --analysis-dir "$ANALYSIS_DIR" \
   --rollout-dir "$ROLLOUT_DIR" \
   --episode-index 0 \
@@ -253,50 +164,16 @@ python scripts/14_render_pi0_dynamic_episode_video.py \
   --tmp-dir /tmp
 ```
 
-Expected analysis outputs:
+Inspect token layout with `scripts/pi0_rollout/inspect_token_layout.py`. MP4 encoding can fail on FUSE paths; `--tmp-dir /tmp` encodes locally first.
 
-```text
-pi0_dynamic_activation_manifest.csv
-pi0_dynamic_activation_norms.csv
-pi0_dynamic_samples.csv
-pi0_dynamic_probe_summary.csv
-pi0_dynamic_probe_*_sample_predictions.csv
-pi0_dynamic_circuit_nodes.csv
-pi0_dynamic_circuit_edges.csv
-pi0_dynamic_episode_000_dashboard.mp4
-```
+## 3. PI0 activation ablation (`scripts/pi0_ablation/`)
 
-## Demo 3: PI0 Full Activation Ablation Sweep
-
-**Goal.** Measure which PI0 layer/token regions causally influence closed-loop policy behavior. Each ablation condition zeros one layer and one token bin during policy forward passes, then compares the resulting rollout against a baseline rollout.
-
-**Experimental setting.**
-
-- 36 layers.
-- 96 token bins.
-- `bin_stride = 4`, so each layer scans 24 bins.
-- Total conditions: `36 x 24 = 864`.
-- Default sharding: 8 shards, around 108 conditions per shard.
-- Default sweep outputs only CSV files: no videos and no saved activations.
-
-Primary metric for heatmaps:
-
-```text
-mean_policy_action_delta_l2
-```
-
-This is the average L2 difference between the ablated policy action and the baseline policy action at matched rollout steps. Larger values mean the ablated layer/bin has larger causal effect on action output.
-
-Choose an output directory:
+**Goal.** Zero one PI0 layer and one token bin during closed-loop rollouts and compare against a baseline. Default sweep: 36 layers × 96 bins with `bin_stride=4` (24 bins per layer, 864 conditions). Primary heatmap metric: `mean_policy_action_delta_l2`.
 
 ```bash
 export ABLATION_DIR="$PWD/outputs/ablation/pi0_ablation_spatial_task1_full_sweep"
-```
 
-**Run one baseline.**
-
-```bash
-python scripts/16_sweep_pi0_activation_ablation.py \
+python scripts/pi0_ablation/sweep.py \
   --config configs/demo.yaml \
   --pi0-path "$PI0_PATH" \
   --output-dir "$ABLATION_DIR" \
@@ -313,119 +190,224 @@ python scripts/16_sweep_pi0_activation_ablation.py \
   --no-save-activations
 ```
 
-**Run locally or on one machine.**
-
-The ablation script can be run directly with Python. For a small smoke test, restrict layers and bins:
+Then shards (`--skip-baseline --baseline-dir "$ABLATION_DIR/baseline" --num-shards 8 --shard-index 0` … `7`), or a small smoke:
 
 ```bash
-python scripts/16_sweep_pi0_activation_ablation.py \
+python scripts/pi0_ablation/sweep.py \
   --config configs/demo.yaml \
   --pi0-path "$PI0_PATH" \
   --output-dir "$ABLATION_DIR" \
   --baseline-dir "$ABLATION_DIR/baseline" \
   --skip-baseline \
-  --task libero_spatial \
-  --task-id 1 \
-  --instruction "pick up the black bowl from table center and place it on the plate" \
-  --num-episodes 1 \
-  --max-steps 80 \
   --layers 0,17,35 \
   --token-bins 96 \
   --bin-indices 0,24,48,72 \
-  --no-save-video \
-  --no-save-activations
+  --num-episodes 1 --max-steps 80 \
+  --no-save-video --no-save-activations
 ```
-
-For the full sweep on one machine, run one shard at a time:
 
 ```bash
-python scripts/16_sweep_pi0_activation_ablation.py \
-  --config configs/demo.yaml \
-  --pi0-path "$PI0_PATH" \
-  --output-dir "$ABLATION_DIR" \
-  --baseline-dir "$ABLATION_DIR/baseline" \
-  --skip-baseline \
-  --task libero_spatial \
-  --task-id 1 \
-  --instruction "pick up the black bowl from table center and place it on the plate" \
-  --num-episodes 2 \
-  --max-steps 250 \
-  --layers all \
-  --token-bins 96 \
-  --bin-stride 4 \
-  --num-shards 8 \
-  --shard-index 0 \
-  --no-save-video \
-  --no-save-activations
-```
-
-Repeat `--shard-index 0..7`.
-
-**Optional cluster-only rjob submission.**
-
-The rjob scripts are only needed on the PJLab-style cluster, or on a similar cluster where jobs must be submitted through `rjob`. If running locally or inside an interactive GPU session, skip this section and use the direct Python commands above.
-
-The helper scripts are:
-
-```text
-scripts/rjob_pi0_ablation_worker.sh
-scripts/rjob_submit_pi0_ablation_sweep.sh
-```
-
-Example:
-
-```bash
-NUM_SHARDS=8 \
-NUM_EPISODES=2 \
-MAX_STEPS=250 \
-BIN_STRIDE=4 \
-PI0_PATH="$PI0_PATH" \
-OUTPUT_DIR="$ABLATION_DIR" \
-bash scripts/rjob_submit_pi0_ablation_sweep.sh
-```
-
-The rjob submitter is a PJLab-style template. On another cluster, either run `scripts/16_sweep_pi0_activation_ablation.py` directly or edit the rjob resource flags and mount settings in `scripts/rjob_submit_pi0_ablation_sweep.sh`.
-
-If the cluster allows only four concurrent jobs, use:
-
-```bash
-NUM_SHARDS=4 BIN_STRIDE=4 bash scripts/rjob_submit_pi0_ablation_sweep.sh
-```
-
-**Merge and plot.**
-
-```bash
-python scripts/17_merge_pi0_ablation_shards.py \
-  --input-dir "$ABLATION_DIR"
-
-python scripts/18_plot_pi0_ablation_heatmaps.py \
+python scripts/pi0_ablation/merge_shards.py --input-dir "$ABLATION_DIR"
+python scripts/pi0_ablation/plot_heatmaps.py \
   --input-dir "$ABLATION_DIR" \
   --metrics mean_policy_action_delta_l2 mean_gripper_position_delta_l2 success_gain \
-  --annotate-top 20 \
-  --top-k 50
+  --annotate-top 20 --top-k 50
 ```
 
-For one unmerged shard:
+One unmerged shard: `python scripts/pi0_ablation/plot_single_shard.py "$ABLATION_DIR/shard_00_of_08"`.
+
+`success_gain` is noisy with one or two episodes; treat action-delta heatmaps as the screening result.
+
+### Optional PJLab rjob
+
+Skip this unless jobs must go through `rjob`. Otherwise run `sweep.py` directly.
 
 ```bash
-python scripts/19_plot_single_pi0_ablation_shard.py \
-  "$ABLATION_DIR/shard_00_of_08"
+NUM_SHARDS=8 NUM_EPISODES=2 MAX_STEPS=250 BIN_STRIDE=4 \
+PI0_PATH="$PI0_PATH" OUTPUT_DIR="$ABLATION_DIR" \
+bash scripts/pi0_ablation/rjob_submit_pi0_ablation_sweep.sh
 ```
 
-Expected outputs:
+## 4. LIBERO rich annotations (`scripts/rich_annotations/`)
 
-```text
-ablation_sweep_results_merged.csv
-figures/heatmap_mean_policy_action_delta_l2.png
-figures/heatmap_mean_gripper_position_delta_l2.png
-figures/heatmap_success_gain.png
-figures/top50_by_mean_policy_action_delta_l2.csv
+Balanced demo sampling plus quantile/event frames. Exports selected agent-view and wrist PNGs and JSONL with per-field `valid` / `provenance`. Distance is never labeled as contact. Action convention: `-1=open`, `+1=close`.
+
+```bash
+python scripts/rich_annotations/extract.py \
+  /path/to/libero_spatial \
+  --output-dir outputs/rich_annotations/libero_spatial_100 \
+  --num-demos 100 \
+  --frames-per-demo 16 \
+  --seed 42 \
+  --simulator auto
 ```
 
-## Notes for the Next Developer
+`--simulator off` skips replay; `required` fails instead of degrading.
 
-- Use GPFS for active sweeps. Copy final results to TOS/S3 after merge. Direct FUSE writes can be slow or flaky.
-- MP4 rendering can fail on FUSE paths. Use `--tmp-dir /tmp` in dashboard rendering so encoding happens locally before copying.
-- `success_gain` is noisy when only one or two episodes are used. Treat action-delta heatmaps as the main causal screening result unless the sweep has many episodes.
-- Demo 1 uses token mean-pooling by default. Full-token probing is possible but memory-heavy.
-- Demo 2 stores full-token activations as many small files to avoid giant NPZ files being killed by memory limits.
+```bash
+python scripts/rich_annotations/inspect_frame.py \
+  outputs/rich_annotations/libero_spatial_100 \
+  --sample-index 0 \
+  --output /tmp/libero-frame-report.md
+```
+
+Select by trajectory with `--episode-id "libero_spatial/<task>/demo_1" --frame 42`. Occupancy GT replay reuses the same `SimulatorReplay` helper.
+
+## 5. Self-occupancy decode (`scripts/occupancy/`)
+
+Replay LIBERO frames, voxelize Panda collision geometry in the Panda base frame, and train decoders from PI0.5 hidden cells to soft occupancy. The grid is `[-0.8, 0.8] × [-0.8, 0.8] × [0.0, 1.6]` metres. Without shuffle / proprioception / pixel controls, a high IoU is **not** evidence of an independent 3D self-model.
+
+### Smoke demo (mean-pooled layers)
+
+```bash
+export PYTHONPATH="$PWD:/path/to/LIBERO"
+
+python scripts/occupancy/run_demo.py \
+  --hdf5 /path/to/libero_spatial/<task>_demo.hdf5 \
+  --pi05-path "$PI05_PATH" \
+  --output-dir outputs/self_occupancy/pi05_libero_spatial_smoke \
+  --num-demos 6 --frames-per-demo 4 \
+  --grid-size 16 --supersample 2
+```
+
+### Full LIBERO-Spatial run
+
+Balances demos across the ten spatial HDF5s, stores resumable activation shards, uses equal-width token bins, and captures the static PaliGemma prefix plus Expert states at Euler times `t=1.0, 0.5, 0.1`. `--bins` is the partition; `--bin-indices` selects which bins are stored and trained.
+
+```bash
+python scripts/occupancy/run_full.py \
+  --dataset-dir /path/to/libero_spatial \
+  --pi05-path "$PI05_PATH" \
+  --output-dir outputs/self_occupancy/pi05_libero_spatial_10k \
+  --stage all \
+  --max-tasks 10 --max-demos 500 --max-frames 20 --max-samples 10000 \
+  --layers all --bins 96 --bin-indices all \
+  --shard-size 8 --epochs 20 --batch-size 128 \
+  --grid-size 16 --supersample 2
+```
+
+Resume with `--stage gt`, `--stage activations`, or `--stage train`. Older full-bin `activation_shards/` are incompatible with a new `--bin-indices` capture; delete that directory or use a new `--output-dir`.
+
+```bash
+python scripts/occupancy/plot_results.py \
+  --run-dir outputs/self_occupancy/pi05_libero_spatial_10k \
+  --plots 1,2,3,4
+```
+
+### Shuffle controls, CMI, NDS
+
+These reuse a finished occupancy run (no recapture).
+
+```bash
+python scripts/occupancy/shuffle_controls.py \
+  --run-dir outputs/self_occupancy/pi05_libero_spatial_10k \
+  --bin-indices auto-1/4 \
+  --controls global_timestep,within_demo \
+  --epochs 20 --device auto
+```
+
+Capacity-constrained \(\widehat{I}_C(H;O\mid Q)=\mathrm{BCE}_Q-\mathrm{BCE}_{HQ}\). `observation_state` is EE+gripper only.
+
+```bash
+python scripts/occupancy/conditional_mi.py \
+  --run-dir outputs/self_occupancy/pi05_libero_spatial_10k \
+  --bin-indices stored --epochs 20 --device auto
+```
+
+`--decoder mlp` (default) is Linear→64→GELU→4096; `--decoder linear` is one Linear. Use a separate `--output-dir` when changing architecture.
+
+Normalized H→Q vs H→O (`NDS_Q`, `NDS_O`, \(D_{O-Q}\)). Bottleneck 64 reuses occupancy `decoder.pt` for H→O.
+
+```bash
+python scripts/occupancy/nds_q_vs_o.py \
+  --run-dir outputs/self_occupancy/pi05_libero_spatial_10k \
+  --bottleneck 64 --epochs 20 --perm-control --device auto
+```
+
+## 6. PI0.5 probe-guided ablation (`scripts/pi05_ablation/`)
+
+Offline (not closed-loop): sample occupancy frames, run a **fresh** `predict_action_chunk` for the baseline and for each selected bin, record flattened chunk L2. Policy cache is reset every forward; `select_action` is never used.
+
+Layer-matched bin selection (not global top-k):
+
+```bash
+python scripts/pi05_ablation/select_bins.py \
+  --metrics outputs/self_occupancy/pi05_libero_spatial_10k/metrics.csv \
+  --output-dir outputs/ablation/pi05_probe_guided_layer_matched \
+  --layers-per-tower 5 --bins-per-group 2 \
+  --min-iou-gap 0.03 --max-good-bin-repeats 2 --expert-max-bin 48
+```
+
+```bash
+python scripts/pi05_ablation/run_offline_ablation.py \
+  --probe-run-dir outputs/self_occupancy/pi05_libero_spatial_10k \
+  --selected-csv outputs/ablation/pi05_probe_guided_layer_matched/selected_conditions.csv \
+  --pi05-path "$PI05_PATH" \
+  --output-dir outputs/ablation/pi05_probe_guided_frames \
+  --num-frames 1000 --sample-seed 0
+```
+
+`sampled_frames.csv` `row_index` aligns with `frame_deltas.npz` `chunk_l2[i]`. Replot with `--plot-only`.
+
+Per-frame scalars (motion, kinematics, proximity, contact, phase; no self-occlusion) and impact-group histograms:
+
+```bash
+python scripts/pi05_ablation/extract_frame_stats.py \
+  --sampled-csv outputs/ablation/pi05_probe_guided_frames/sampled_frames.csv \
+  --output-dir outputs/ablation/pi05_probe_guided_frames/frame_stats \
+  --simulator auto --replay-mode selected
+
+python scripts/pi05_ablation/plot_frame_stat_groups.py \
+  --stats-csv outputs/ablation/pi05_probe_guided_frames/frame_stats/frame_stats.csv \
+  --impact-csv outputs/ablation/pi05_probe_guided_frames/frame_good_minus_bad.csv \
+  --output-dir outputs/ablation/pi05_probe_guided_frames/frame_stat_groups
+```
+
+Impact is `mean(Δ_good) − mean(Δ_bad)`. Default groups: highest 20%, nearest-to-zero 20% of the remainder, lowest 20%. Histograms overlay those three groups per dimension, including LIBERO task.
+
+Optional closed-loop IoU-diff plot (older `outputs/ablation/pi05_probe_guided` rollouts, not the offline frame job): `scripts/pi05_ablation/plot_closed_loop_iou_diff.py`. The PI0.5 closed-loop tracer used by intervention hooks is `src/online_rollout.py` / `src/online_rollout_cli.py`.
+
+## Tests
+
+| Module | File |
+|---|---|
+| Rich annotations | `tests/test_libero_rich_annotations.py` |
+| Annotation report | `tests/test_libero_annotation_report.py` |
+| Occupancy voxelize / split | `tests/test_libero_self_occupancy.py` |
+| CMI / NDS | `tests/test_pi05_occupancy_cmi.py`, `tests/test_pi05_nds_q_vs_o.py` |
+| Bin selection | `tests/test_pi05_probe_ablation.py` |
+| Offline ablation | `tests/test_pi05_frame_ablation.py` |
+| Frame stats / groups | `tests/test_pi05_frame_stats.py`, `tests/test_pi05_frame_stat_groups.py` |
+
+LIBERO integration tests skip unless `RUN_LIBERO_INTEGRATION=1`. Full occupancy capture, PI0.5 forwards, and 1000-frame ablation need a GPU.
+
+## Old script numbers
+
+| Old | New |
+|---|---|
+| `scripts/01_collect_states.py` | `scripts/probe/collect_states.py` |
+| `scripts/02_extract_activations.py` | `scripts/probe/extract_activations.py` |
+| `scripts/03_train_layerwise_probe.py` | `scripts/probe/train_layerwise_probe.py` |
+| `scripts/05_plot_results.py` | `scripts/probe/plot_results.py` |
+| `scripts/09_collect_pi0_libero_rollouts.py` | `scripts/pi0_rollout/collect.py` |
+| `scripts/13_analyze_pi0_dynamic_circuit.py` | `scripts/pi0_rollout/analyze_dynamic_circuit.py` |
+| `scripts/14_render_pi0_dynamic_episode_video.py` | `scripts/pi0_rollout/render_dashboard.py` |
+| `scripts/15_inspect_pi0_token_layout.py` | `scripts/pi0_rollout/inspect_token_layout.py` |
+| `scripts/16_sweep_pi0_activation_ablation.py` | `scripts/pi0_ablation/sweep.py` |
+| `scripts/17_merge_pi0_ablation_shards.py` | `scripts/pi0_ablation/merge_shards.py` |
+| `scripts/18_plot_pi0_ablation_heatmaps.py` | `scripts/pi0_ablation/plot_heatmaps.py` |
+| `scripts/19_plot_single_pi0_ablation_shard.py` | `scripts/pi0_ablation/plot_single_shard.py` |
+| `scripts/20_extract_libero_rich_annotations.py` | `scripts/rich_annotations/extract.py` |
+| `scripts/21_inspect_libero_rich_frame.py` | `scripts/rich_annotations/inspect_frame.py` |
+| `scripts/22_run_pi05_self_occupancy_demo.py` | `scripts/occupancy/run_demo.py` |
+| `scripts/23_run_pi05_self_occupancy_full.py` | `scripts/occupancy/run_full.py` |
+| `scripts/24_plot_pi05_self_occupancy_results.py` | `scripts/occupancy/plot_results.py` |
+| `scripts/25_run_pi05_occupancy_shuffle_controls.py` | `scripts/occupancy/shuffle_controls.py` |
+| `scripts/27_run_pi05_occupancy_conditional_mi.py` | `scripts/occupancy/conditional_mi.py` |
+| `scripts/28_run_pi05_nds_q_vs_o.py` | `scripts/occupancy/nds_q_vs_o.py` |
+| `scripts/30_select_pi05_ablation_bins.py` | `scripts/pi05_ablation/select_bins.py` |
+| `scripts/26_run_pi05_probe_guided_ablation.py` | `scripts/pi05_ablation/run_offline_ablation.py` |
+| `scripts/31_extract_pi05_frame_stats.py` | `scripts/pi05_ablation/extract_frame_stats.py` |
+| `scripts/32_plot_pi05_frame_stat_groups.py` | `scripts/pi05_ablation/plot_frame_stat_groups.py` |
+| `scripts/29_plot_pi05_probe_frame_iou_diff.py` | `scripts/pi05_ablation/plot_closed_loop_iou_diff.py` |
+| `scripts/rjob_*.sh` | `scripts/pi0_ablation/rjob_*.sh` |
