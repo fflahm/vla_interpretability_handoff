@@ -1,6 +1,6 @@
 # VLA Interpretability
 
-Code for reading and intervening on PI0 / PI0.5 hidden states on LIBERO. The repository is organized as six experiment blocks. Library code lives in `src/`; each block has its own CLI under `scripts/<block>/`.
+Code for reading and intervening on PI0 / PI0.5 hidden states on LIBERO. The repository is organized as six experiment blocks plus H-cluster rjob wrappers. Library code lives in `src/`; each block has its own CLI under `scripts/<block>/`.
 
 ```text
 scripts/
@@ -8,8 +8,9 @@ scripts/
   pi0_rollout/        Demo 2 — PI0 closed-loop tracing, probes, dashboard video
   pi0_ablation/       Demo 3 — PI0 layer × token-bin activation ablation
   rich_annotations/   Auditable LIBERO demo/frame labels
-  occupancy/          PI0.5 3D self-occupancy decode, controls, CMI, NDS
+  occupancy/          PI0.5 3D self-occupancy: demo, Libero-100 GT, token-bin activations
   pi05_ablation/      Probe-guided offline action-chunk ablation and frame stats
+  hcluster/           PJLab rjob submit/workers (GPU smoke, occupancy GT, activations)
 ```
 
 Run artifacts belong in untracked `outputs/`. This repo does not ship HDF5, checkpoints, or experiment results.
@@ -85,6 +86,84 @@ CPU-only unit tests (no GPU, no full LIBERO replay):
 ```bash
 PYTHONNOUSERSITE=1 python -m unittest discover -s tests
 ```
+
+On the PJLab H-cluster **开发机 there is no GPU**. GPU jobs and large occupancy extracts go through `rjob`. See [H-cluster, TOS, and rjob](#h-cluster-tos-and-rjob). Longer cluster notes (Chinese): `/home/guoshengyu/help/rjob在本机跑GPU实验.md`.
+
+## H-cluster, TOS, and rjob
+
+Operational notes for this checkout. Official PDFs remain `012--rlaunch.pdf` / `013--rjob分布式训练任务.pdf`. Do **not** print or commit TOS AK/SK.
+
+### Layout
+
+| Layer | Path | On rjob worker? | Use |
+|---|---|---|---|
+| Home | `/home/guoshengyu` | **No** | Dotfiles, interactive conda. Do not put the only env here. |
+| GPFS (100G quota) | `/mnt/shared-storage-user/guoshengyu` | **Yes** (`--mount=gpfs://gpfs1/guoshengyu:...`) | Code, rjob conda, logs, tokenizer, `bin/s3mount` |
+| TOS (S3 FUSE) | `/data/tos`, bucket `ailab-pceval` | Worker must `s3mount` | Checkpoints, LIBERO, occupancy GT/images/activations |
+
+| Item | Path |
+|---|---|
+| This repo | `/mnt/shared-storage-user/guoshengyu/vla_interpretability_handoff` |
+| rjob conda | `/mnt/shared-storage-user/guoshengyu/envs/vla-interpretability` |
+| Interactive conda | `/home/guoshengyu/.conda/envs/vla-interpretability` |
+| rjob logs | `/mnt/shared-storage-user/guoshengyu/vla_rjob_runs/` |
+| Offline PaliGemma tokenizer | `/mnt/shared-storage-user/guoshengyu/models/paligemma-3b-pt-224-tokenizer` |
+| `s3mount` binary | `/mnt/shared-storage-user/guoshengyu/bin/s3mount` |
+| TOS creds (mode 600) | `/mnt/shared-storage-user/guoshengyu/.pjlab_s3.sh` (also `~/.pjlab_s3.sh`) |
+| PI0.5 | `/data/tos/guoshengyu/vla/models/pi05_libero` |
+| PI0 | `/data/tos/guoshengyu/vla/models/pi0_libero_finetuned_v044` |
+| LIBERO source/assets | `/data/tos/guoshengyu/vla/libero/LIBERO` |
+| LIBERO HDF5 | `/data/tos/guoshengyu/vla/libero/{libero_spatial,libero_object,libero_goal,libero_10,libero_90}` |
+| Occupancy GT + RGB | `/data/tos/guoshengyu/vla/occupancy/{gt,images}` |
+| Occupancy activation smoke | `/data/tos/guoshengyu/vla/occupancy_act_rjob_smoke/` |
+| Occupancy activations (full) | `/data/tos/guoshengyu/vla/occupancy_activations/` |
+
+**TOS write rule:** `s3mount` cannot rename. Use `open(path, "wb")` / `np.save` / `rsync --inplace`. Do not `np.savez` (zip seeks) and do not `rsync -a` onto TOS.
+
+**Billing:** `--charged-group=pceval_gpu` and `--private-machine=group`. `pceval_cpu` cannot schedule these jobs. CPU-only occupancy GT still uses `pceval_gpu` with `--gpu=0`.
+
+**Network:** no `hf-mirror`. 开发机: `source ~/.pjlab_proxy.sh && proxy_on`. GPU workers stay **offline** (`HF_HUB_OFFLINE=1`).
+
+### Submit template
+
+```bash
+# GPU smoke (EGL + PI0/PI0.5, 1 ep × 80 steps). Results on GPFS, not repo outputs/.
+bash /mnt/shared-storage-user/guoshengyu/vla_interpretability_handoff/scripts/hcluster/rjob_submit_gpu_smoke.sh
+rjob list | grep vla-gpu-smoke
+```
+
+Required flags (also used by occupancy workers): `--mount=gpfs://gpfs1/guoshengyu:...`, `--custom-resources brainpp.cn/fuse=1`, image `registry.h.pjlab.org.cn/ailab-pceval-pceval_gpu/pcgroup:ubuntu22.04-cuda12.2.2-pjlab-testv1`. GPU jobs need `-e NVIDIA_DRIVER_CAPABILITIES=all` at **submit** time. Metadata names look like `showname-<digits>` (e.g. `vla-occ-act-smoke-27039131`).
+
+```bash
+rjob get <metadata-name>
+rjob logs job <metadata-name> -n 120
+rjob stop <metadata-name>
+ls /mnt/shared-storage-user/guoshengyu/vla_rjob_runs/
+```
+
+Workers run as root (`HOME=/root`). Write `/root/.libero/config.yaml` before importing LIBERO, and pipe `printf "N\nN\n...\n"` into Python so the custom-path prompt cannot `EOFError`.
+
+### Cluster pitfalls that already bit this project
+
+- Worker `nproc` often reports **1** while `sched_getaffinity` has the full `--cpu` grant (e.g. 32). Occupancy GT workers ignore bogus `nproc`.
+- Empty `INCLUDE_TASKS=` with `${VAR:-default}` is treated as unset. Occupancy GT submit uses `${INCLUDE_TASKS-}` (no colon) when `SMOKE=0`.
+- pip `libero` has no `assets/`; symlink TOS assets into site-packages.
+- `MUJOCO_GL=egl` loads EGL even for XML-only MuJoCo. Occupancy GT uses `MUJOCO_GL=disable`.
+- Do not write experiment trees through a dangling `outputs/` → TOS symlink on an unmounted worker.
+
+### Verified runs (as of 2026-09-17)
+
+| Job / artifact | Result |
+|---|---|
+| `vla-gpu-smoke-*` (help note `69320028`) | CUDA, unit tests, EGL, 1×80-step PI0/PI0.5. Short horizon ⇒ `success_rate=0` is expected. |
+| Occupancy **demo** via `rjob_submit_occupancy_demo.sh` | Succeeded. GPFS `vla_rjob_runs/20260915_160947/occupancy_demo/`. 6 demos × 4 frames; best `paligemma_layer_08`, held-out soft IoU **0.447**. |
+| Occupancy GT smoke `vla-occ-gt-smoke-85223869` | Succeeded. GT `np.array_equal` vs 开发机 SCENE3 `demo_0`. |
+| Occupancy GT multi-process smoke `vla-occ-gt-mp-23564098` | Succeeded. Four kitchen `demo_0`s, GT equal. |
+| Occupancy GT full tree | TOS `/data/tos/guoshengyu/vla/occupancy`: **5000/5000** intact (`extract_libero_gt.py --verify`). 20 frames/demo, 16³, float16. `vla-occ-gt-full-56475930` itself **Failed** (4/16 shards: `new_salad_dressing` vs `salad_dressing` on LIVING_ROOM_SCENE4); remaining demos were filled later. Resume skips complete npy. |
+| Occupancy **activation** smoke `vla-occ-act-smoke-27039131` | Succeeded (H200-0350). Tokens 968 / 50; bins 97 / 5; Euler times `1.0,0.8,0.6,0.3,0.1`. Shapes `paligemma.npy (18,4,97,2048)`, `expert.npy (18,5,4,5,1024)`. Earlier `53931850` Failed (`np.savez` seek on TOS). |
+| Occupancy activation **full** (50 libero-90 tasks) | Not started. Command in the occupancy section. |
+
+H-cluster scripts: `scripts/hcluster/rjob_submit_gpu_smoke.sh`, `rjob_gpu_smoke_worker.sh`, `rjob_submit_occupancy_demo.sh`, `rjob_submit_occupancy_gt.sh`, `rjob_occupancy_gt_worker.sh`, `libero_occupancy_gt_status.sh`, `rjob_submit_occupancy_act.sh`, `rjob_occupancy_act_worker.sh`, `libero_occupancy_act_status.sh`. TOS mount on 开发机: `s3mount ailab-pceval /data/tos --endpoint-url http://hdd1.h.pjlab.org.cn:8060 --allow-delete --allow-overwrite --force-path-style` after `source ~/.pjlab_s3.sh`.
 
 ## 1. Layerwise probing (`scripts/probe/`)
 
@@ -257,22 +336,83 @@ Select by trajectory with `--episode-id "libero_spatial/<task>/demo_1" --frame 4
 
 Replay LIBERO frames, voxelize Panda collision geometry in the Panda base frame, and train decoders from PI0.5 hidden cells to soft occupancy. The grid is `[-0.8, 0.8] × [-0.8, 0.8] × [0.0, 1.6]` metres. Without shuffle / proprioception / pixel controls, a high IoU is **not** evidence of an independent 3D self-model.
 
+GT kernel: CPU MuJoCo (`SimulatorReplay` / `ControlEnv`, cameras off). Each demo uses the same 20 evenly spaced frames as `run_full.py`. Occupancy rjob workers write each demo to TOS immediately (`occupancy.npy` + PNGs via `wb`); they do not buffer until the job ends.
+
 ### Smoke demo (mean-pooled layers)
 
-```bash
-export PYTHONPATH="$PWD:/path/to/LIBERO"
+Verified on rjob (`scripts/hcluster/rjob_submit_occupancy_demo.sh`). GPFS copy: `vla_rjob_runs/20260915_160947/occupancy_demo/` (best `paligemma_layer_08`, soft IoU 0.447).
 
+```bash
+bash scripts/hcluster/rjob_submit_occupancy_demo.sh
+
+# Direct (needs GPU + TOS hdf5):
+export PYTHONPATH="$PWD"
 python scripts/occupancy/run_demo.py \
-  --hdf5 /path/to/libero_spatial/<task>_demo.hdf5 \
+  --hdf5 /data/tos/guoshengyu/vla/libero/libero_spatial/<task>_demo.hdf5 \
   --pi05-path "$PI05_PATH" \
-  --output-dir outputs/self_occupancy/pi05_libero_spatial_smoke \
+  --output-dir /mnt/shared-storage-user/guoshengyu/vla_rjob_runs/occupancy_demo \
   --num-demos 6 --frames-per-demo 4 \
   --grid-size 16 --supersample 2
 ```
 
-### Full LIBERO-Spatial run
+### Libero-100 occupancy GT (images + voxels, no decoder)
 
-Balances demos across the ten spatial HDF5s, stores resumable activation shards, uses equal-width token bins, and captures the static PaliGemma prefix plus Expert states at Euler times `t=1.0, 0.5, 0.1`. `--bins` is the partition; `--bin-indices` selects which bins are stored and trained.
+`scripts/occupancy/extract_libero_gt.py` writes TOS-safe per-demo files (no rename):
+
+```text
+/data/tos/guoshengyu/vla/occupancy/
+  images/<suite>/<task>/<demo>/frame_XXXX_{agentview,wrist}.png
+  gt/<suite>/<task>/<demo>/occupancy.npy   # float16 [20,16,16,16]
+  gt/<suite>/<task>/<demo>/samples.jsonl
+```
+
+Rerun skips a demo if `occupancy.npy` already has 20 frames. 开发机 is CPU-only and ~32–45 s/demo; rjob uses `--gpu=0` and 16 task shards on 32 CPUs.
+
+```bash
+python scripts/occupancy/extract_libero_gt.py \
+  --output-root /data/tos/guoshengyu/vla/occupancy --status
+python scripts/occupancy/extract_libero_gt.py \
+  --output-root /data/tos/guoshengyu/vla/occupancy --verify
+bash scripts/hcluster/libero_occupancy_gt_status.sh
+
+# rjob smoke (isolated prefix, compare vs 开发机 npy)
+bash scripts/hcluster/rjob_submit_occupancy_gt.sh
+
+# rjob full / resume (INCLUDE_TASKS= must use the no-colon default)
+NAME=vla-occ-gt-full SMOKE=0 GPU=0 CPU=32 MEMORY=160000 NUM_WORKERS=16 \
+  OUTPUT_ROOT=/data/tos/guoshengyu/vla/occupancy INCLUDE_TASKS= \
+  STATUS_SUFFIX=rjob \
+  bash scripts/hcluster/rjob_submit_occupancy_gt.sh
+```
+
+As of 2026-09-17 `--verify` reports **5000/5000 ALL_OK** (`libero_10` + `libero_90`).
+
+### Token-bin activations on libero-90 (no decoder yet)
+
+`scripts/occupancy/extract_libero_activations.py` uses the same Euler capture as `run_full.py` (`Pi05EulerCapture`) with these defaults:
+
+1. Contiguous bins of **10 tokens** (not skip-stride). PaliGemma 968 → **97** bins; expert 50 → **5** bins (102 token-position bins **summed across towers per layer**, not 102 stored on every layer).
+2. Expert: **5** uniform times from the 10-step Euler loop: `1.0, 0.8, 0.6, 0.3, 0.1`.
+3. Seed **42**: 50 random **complete** libero-90 tasks; each task’s 50 demos split **30/10/10** train/test/ablation. Only train+test are inferred (2000 demos × 20 frames). Recorded in `OUTPUT_ROOT/split.json`.
+4. Reuses occupancy **images**; does not copy `occupancy.npy`.
+5. Per-demo TOS files: `paligemma.npy` `[18,F,97,2048]`, `expert.npy` `[18,5,F,5,1024]`, float16.
+
+Smoke: `vla-occ-act-smoke-27039131` (4 frames). `--verify` reads `metadata.json` `frames`; expecting 20 on a 4-frame smoke file is a false `bad=1`. Full job is not started; estimate ~2.5–4 h and ~300 GB on one GPU.
+
+```bash
+bash scripts/hcluster/rjob_submit_occupancy_act.sh
+python scripts/occupancy/extract_libero_activations.py \
+  --output-root /data/tos/guoshengyu/vla/occupancy_act_rjob_smoke --verify
+
+NAME=vla-occ-act-full SMOKE=0 GPU=1 CPU=16 MEMORY=98304 \
+  OUTPUT_ROOT=/data/tos/guoshengyu/vla/occupancy_activations \
+  bash scripts/hcluster/rjob_submit_occupancy_act.sh
+bash scripts/hcluster/libero_occupancy_act_status.sh
+```
+
+### Full LIBERO-Spatial run (`run_full.py`)
+
+Balances demos across the ten spatial HDF5s, stores resumable activation shards, uses equal-width token bins, and captures the static PaliGemma prefix plus Expert states at Euler times `t=1.0, 0.5, 0.1`. `--bins` is the partition; `--bin-indices` selects which bins are stored and trained. This in-repo Spatial pipeline is **not** the Libero-90 50-task extract above (that one uses 10-token contiguous bins and five flow times).
 
 ```bash
 python scripts/occupancy/run_full.py \
@@ -410,4 +550,6 @@ LIBERO integration tests skip unless `RUN_LIBERO_INTEGRATION=1`. Full occupancy 
 | `scripts/31_extract_pi05_frame_stats.py` | `scripts/pi05_ablation/extract_frame_stats.py` |
 | `scripts/32_plot_pi05_frame_stat_groups.py` | `scripts/pi05_ablation/plot_frame_stat_groups.py` |
 | `scripts/29_plot_pi05_probe_frame_iou_diff.py` | `scripts/pi05_ablation/plot_closed_loop_iou_diff.py` |
-| `scripts/rjob_*.sh` | `scripts/pi0_ablation/rjob_*.sh` |
+| `scripts/rjob_*.sh` | `scripts/pi0_ablation/rjob_*.sh` and `scripts/hcluster/rjob_*.sh` |
+| *(new)* occupancy GT | `scripts/occupancy/extract_libero_gt.py` |
+| *(new)* occupancy activations | `scripts/occupancy/extract_libero_activations.py` |

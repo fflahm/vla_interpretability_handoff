@@ -10,11 +10,19 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from .libero_self_occupancy import SelfOccupancySample, token_position_bins
+from .libero_self_occupancy import (
+    SelfOccupancySample,
+    contiguous_token_bins,
+    token_position_bins,
+    uniform_euler_flow_times,
+)
 from .models import Pi05Wrapper, _move_tensors_to_device
 from .utils import ensure_dir, log
 
+# Legacy 3-time set used by scripts/occupancy/run_full.py.
 FLOW_TIMES = (1.0, 0.5, 0.1)
+# Default for the Libero-90 activation extract: 5 of the 10 Euler times.
+UNIFORM_FLOW_TIMES = tuple(round(float(t), 1) for t in uniform_euler_flow_times(num_steps=10, count=5))
 
 
 def safe_condition_name(condition: str) -> str:
@@ -83,19 +91,38 @@ class Pi05EulerCapture:
         device: str = "auto",
         bins: int = 96,
         bin_indices: Sequence[int] | None = None,
+        *,
+        tokens_per_bin: int | None = None,
+        flow_times: Sequence[float] | None = None,
+        num_steps: int = 10,
     ) -> None:
         self.model_id = model_id
         self.bins = bins
+        self.tokens_per_bin = None if tokens_per_bin is None else int(tokens_per_bin)
         self.bin_indices = None if bin_indices is None else [int(v) for v in bin_indices]
+        self.flow_times = tuple(FLOW_TIMES if flow_times is None else [float(t) for t in flow_times])
+        self.num_steps = int(num_steps)
         self.last_bin_maps: dict[str, list[int]] = {}
+        self.last_token_lengths: dict[str, int] = {}
+        bin_desc = (
+            f"tokens_per_bin={self.tokens_per_bin}"
+            if self.tokens_per_bin
+            else f"bins={bins} store_bins={self.bin_indices if self.bin_indices is not None else 'all'}"
+        )
         log(
             f"Loading PI0.5 Euler capture model from {model_id} "
-            f"bins={bins} store_bins={self.bin_indices if self.bin_indices is not None else 'all'} "
-            f"device={device}"
+            f"{bin_desc} flow_times={self.flow_times} num_steps={self.num_steps} device={device}"
         )
         started = time.perf_counter()
         self.wrapper = Pi05Wrapper(model_id=model_id, pooling="mean", device=device)
         log(f"PI0.5 Euler capture ready in {time.perf_counter() - started:.1f}s device={self.wrapper.device_obj}")
+
+    def _bin_tokens(self, array: np.ndarray) -> tuple[np.ndarray, list[int]]:
+        if self.tokens_per_bin:
+            binned = contiguous_token_bins(array, self.tokens_per_bin)[0]
+        else:
+            binned = token_position_bins(array, self.bins)[0]
+        return self._store_bins(binned)
 
     def _store_bins(self, binned: np.ndarray) -> tuple[np.ndarray, list[int]]:
         """Keep equal-width boundaries from ``self.bins``, optionally drop unselected bins."""
@@ -137,11 +164,12 @@ class Pi05EulerCapture:
                         return
                 else:
                     t = current_time[0]
-                    if t is None or min(abs(t - wanted) for wanted in FLOW_TIMES) > 1e-5:
+                    if t is None or min(abs(t - wanted) for wanted in self.flow_times) > 1e-5:
                         return
-                    key = f"expert/layer_{index:02d}/t={min(FLOW_TIMES, key=lambda x: abs(x-t)):.1f}"
+                    key = f"expert/layer_{index:02d}/t={min(self.flow_times, key=lambda x: abs(x-t)):.1f}"
                 array = tensor.detach().float().cpu().numpy()
-                stored, usable = self._store_bins(token_position_bins(array, self.bins)[0])
+                self.last_token_lengths[tower] = int(array.shape[-2])
+                stored, usable = self._bin_tokens(array)
                 captured[key] = stored
                 bin_maps[key] = usable
             return hook
@@ -165,7 +193,7 @@ class Pi05EulerCapture:
         core.denoise_step = traced_denoise_step
         try:
             with torch.inference_mode():
-                core.sample_actions(images, img_masks, tokens, masks, num_steps=10)
+                core.sample_actions(images, img_masks, tokens, masks, num_steps=self.num_steps)
         finally:
             core.denoise_step = original_denoise_step
             for handle in handles:
@@ -173,7 +201,7 @@ class Pi05EulerCapture:
         expected = {
             *(f"paligemma/layer_{i:02d}/static" for i in range(len(pg)) if layer_indices is None or i in layer_indices),
             *(f"expert/layer_{i:02d}/t={t:.1f}" for i in range(len(expert))
-              for t in FLOW_TIMES if layer_indices is None or i in layer_indices),
+              for t in self.flow_times if layer_indices is None or i in layer_indices),
         }
         missing = expected.difference(captured)
         if missing:

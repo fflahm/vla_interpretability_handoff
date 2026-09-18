@@ -15,7 +15,7 @@ from tqdm import trange
 
 from .activations import stack_layer_activations
 from .envs import LiberoEnv, _flatten_keys, _get_nested, _instruction_object_match, _normalize_libero_object_name
-from .utils import ensure_dir
+from .utils import ensure_dir, paligemma_tokenizer_overrides
 
 
 DEFAULT_RENAME_MAP = {"observation.images.image2": "observation.images.wrist_image"}
@@ -114,6 +114,7 @@ class Pi05LiberoRolloutTracer:
             preprocessor_overrides={
                 "device_processor": {"device": str(self.device)},
                 "rename_observations_processor": {"rename_map": rename_map},
+                **paligemma_tokenizer_overrides(),
             },
         )
         env_processor_kwargs = {"env_cfg": self.env_cfg, "policy_cfg": self.policy.config}

@@ -31,10 +31,10 @@ from src.utils import ensure_dir, log, set_seed
 
 
 DEFAULT_HDF5 = Path(
-    "/home/eai/mars/simulator/LIBERO/libero/libero/datasets/libero_spatial/"
+    "/data/tos/guoshengyu/vla/libero/libero_spatial/"
     "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
 )
-DEFAULT_MODEL = Path("/home/eai/mars/hub/models/pi05_libero")
+DEFAULT_MODEL = Path("/data/tos/guoshengyu/vla/models/pi05_libero")
 
 
 def parse_args() -> argparse.Namespace:

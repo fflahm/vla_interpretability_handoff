@@ -8,3 +8,5 @@ __pycache__/
 
 # All experiment artifacts stay local. Never commit run data.
 /outputs/
+/outputs
+/data/

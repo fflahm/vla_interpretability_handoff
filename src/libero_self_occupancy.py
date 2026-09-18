@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,6 +121,71 @@ class SelfOccupancySample:
     @property
     def episode_id(self) -> str:
         return f"{self.suite}/{self.task}/{self.demo_key}"
+
+
+def infer_libero_suite(hdf5_path: Path, suite: str | None = None) -> str:
+    if suite:
+        return suite
+    name = hdf5_path.resolve().parent.name
+    if name.startswith("libero_"):
+        return name
+    return "libero_spatial"
+
+
+def stable_image_dir(image_root: Path, suite: str, task: str, demo_key: str) -> Path:
+    return Path(image_root) / suite / task / demo_key
+
+
+def stable_image_paths(
+    image_root: Path, suite: str, task: str, demo_key: str, frame_index: int
+) -> tuple[Path, Path]:
+    folder = stable_image_dir(image_root, suite, task, demo_key)
+    stem = f"frame_{int(frame_index):04d}"
+    return folder / f"{stem}_agentview.png", folder / f"{stem}_wrist.png"
+
+
+def save_png_inplace(path: Path, array: np.ndarray, *, reuse: bool = True) -> bool:
+    """Write a PNG directly (no tempfile). Return True if a new file was written."""
+    if reuse and path.exists() and path.stat().st_size > 0:
+        return False
+    ensure_dir(path.parent)
+    Image.fromarray(np.asarray(array, dtype=np.uint8)).save(path)
+    return True
+
+
+def save_npy_inplace(path: Path, array: np.ndarray) -> None:
+    """Write `.npy` with `wb` so s3mount does not need rename."""
+    ensure_dir(path.parent)
+    with open(path, "wb") as handle:
+        np.save(handle, array)
+
+
+def configure_headless_mujoco() -> None:
+    """Keep occupancy GT CPU-only. robosuite otherwise forces MUJOCO_GL=egl.
+
+    ``import robosuite.macros`` would load ``robosuite/__init__.py`` and pull in
+    EGL, so macros.py is loaded by file path and registered first.
+    """
+    gl = os.environ.get("MUJOCO_GL", "disable").lower().strip()
+    if gl not in ("", "disable", "disabled", "off", "false", "0"):
+        return
+    os.environ["MUJOCO_GL"] = "disable"
+    if "robosuite.macros" in sys.modules:
+        sys.modules["robosuite.macros"].MUJOCO_GPU_RENDERING = False
+        return
+    import importlib.util
+
+    spec = importlib.util.find_spec("robosuite")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    macros_path = Path(spec.submodule_search_locations[0]) / "macros.py"
+    macro_spec = importlib.util.spec_from_file_location("robosuite.macros", macros_path)
+    if macro_spec is None or macro_spec.loader is None:
+        return
+    macros = importlib.util.module_from_spec(macro_spec)
+    sys.modules["robosuite.macros"] = macros
+    macro_spec.loader.exec_module(macros)
+    macros.MUJOCO_GPU_RENDERING = False
 
 
 def evenly_spaced_indices(length: int, count: int) -> list[int]:
@@ -246,32 +313,51 @@ def collect_self_occupancy_samples(
     frames_per_demo: int,
     spec: OccupancyGridSpec,
     libero_root: Path = LOCAL_LIBERO_ROOT,
+    suite: str | None = None,
+    image_root: Path | None = None,
+    reuse_images: bool = True,
+    skip_demo_keys: set[str] | None = None,
+    on_demo: Any | None = None,
 ) -> tuple[list[SelfOccupancySample], dict[str, Any]]:
-    """Replay selected HDF5 frames and create images plus soft occupancy GT."""
+    """Replay selected HDF5 frames and create images plus soft occupancy GT.
+
+    Images are written under ``image_root/suite/task/demo/frame_XXXX_{agentview,wrist}.png``
+    so later occupancy or policy jobs can reuse them. If ``image_root`` is omitted,
+    they go to ``output_dir/images`` with the same stable layout.
+    """
 
     output_dir = ensure_dir(output_dir)
-    image_dir = ensure_dir(output_dir / "images")
+    suite_name = infer_libero_suite(hdf5_path, suite)
+    image_root = Path(image_root) if image_root is not None else ensure_dir(output_dir / "images")
+    skip_demo_keys = skip_demo_keys or set()
     samples: list[SelfOccupancySample] = []
     episode_timings: list[dict[str, Any]] = []
     occupancy_metadata: dict[str, Any] | None = None
     started = time.perf_counter()
+    images_written = 0
+    images_reused = 0
+    configure_headless_mujoco()
     with h5py.File(hdf5_path, "r") as handle:
         data = handle["data"]
         instruction = _instruction(data, hdf5_path)
         demo_keys = sorted(data.keys(), key=_demo_sort_key)[:num_demos]
         task = hdf5_path.name.removesuffix("_demo.hdf5")
         log(
-            f"GT collect start task={task!r} demos={len(demo_keys)} "
-            f"frames_per_demo={frames_per_demo} grid={spec.size}^3"
+            f"GT collect start suite={suite_name} task={task!r} demos={len(demo_keys)} "
+            f"skip={len(skip_demo_keys)} frames_per_demo={frames_per_demo} grid={spec.size}^3 "
+            f"image_root={image_root}"
         )
-        bddl_path = _resolve_bddl(handle, task, "libero_spatial", libero_root)
+        bddl_path = _resolve_bddl(handle, task, suite_name, libero_root)
         if bddl_path is None:
-            raise FileNotFoundError(f"Could not resolve BDDL for {hdf5_path}.")
+            raise FileNotFoundError(f"Could not resolve BDDL for {hdf5_path} suite={suite_name}.")
         assets_root = libero_root / "libero" / "libero" / "assets"
         robosuite_assets = robosuite_assets_root()
 
         demo_bar = tqdm(demo_keys, desc=f"GT demos [{task[:40]}]", unit="demo", leave=True)
         for demo_key in demo_bar:
+            if demo_key in skip_demo_keys:
+                demo_bar.set_postfix(skip=demo_key)
+                continue
             episode_started = time.perf_counter()
             demo = data[demo_key]
             obs = demo["obs"]
@@ -280,6 +366,7 @@ def collect_self_occupancy_samples(
                 native(demo.attrs.get("model_file", "")), assets_root, robosuite_assets
             )
             replay = SimulatorReplay(bddl_path, repaired_xml)
+            demo_samples: list[SelfOccupancySample] = []
             try:
                 voxelizer = RobotCollisionVoxelizer(replay, spec)
                 occupancy_metadata = voxelizer.metadata()
@@ -289,20 +376,32 @@ def collect_self_occupancy_samples(
                     )
                     replay.sim.forward()
                     occupancy = voxelizer.voxelize()
-                    sample_id = len(samples)
-                    image_path = image_dir / f"{sample_id:04d}_agentview.png"
-                    wrist_path = image_dir / f"{sample_id:04d}_wrist.png"
-                    Image.fromarray(np.asarray(obs["agentview_rgb"][frame_index], dtype=np.uint8)).save(image_path)
-                    Image.fromarray(np.asarray(obs["eye_in_hand_rgb"][frame_index], dtype=np.uint8)).save(wrist_path)
+                    image_path, wrist_path = stable_image_paths(
+                        image_root, suite_name, task, demo_key, frame_index
+                    )
+                    if save_png_inplace(
+                        image_path, np.asarray(obs["agentview_rgb"][frame_index], dtype=np.uint8),
+                        reuse=reuse_images,
+                    ):
+                        images_written += 1
+                    else:
+                        images_reused += 1
+                    if save_png_inplace(
+                        wrist_path, np.asarray(obs["eye_in_hand_rgb"][frame_index], dtype=np.uint8),
+                        reuse=reuse_images,
+                    ):
+                        images_written += 1
+                    else:
+                        images_reused += 1
                     observation_state = np.concatenate(
                         (
                             np.asarray(obs["ee_states"][frame_index], dtype=np.float32),
                             np.asarray(obs["gripper_states"][frame_index], dtype=np.float32),
                         )
                     )
-                    samples.append(
+                    demo_samples.append(
                         SelfOccupancySample(
-                            sample_id=sample_id,
+                            sample_id=len(samples) + len(demo_samples),
                             demo_key=demo_key,
                             frame_index=frame_index,
                             image_path=str(image_path),
@@ -310,37 +409,48 @@ def collect_self_occupancy_samples(
                             instruction=instruction,
                             observation_state=observation_state.astype(float).tolist(),
                             occupancy=occupancy.astype(np.float32),
+                            suite=suite_name,
+                            task=task,
                         )
                     )
             finally:
                 replay.close()
-            episode_seconds = time.perf_counter() - episode_started
-            episode_timings.append(
-                {
-                    "demo_key": demo_key,
-                    "frames": frame_indices,
-                    "seconds": episode_seconds,
-                }
-            )
+            samples.extend(demo_samples)
+            episode_record = {
+                "demo_key": demo_key,
+                "frames": frame_indices,
+                "seconds": time.perf_counter() - episode_started,
+                "num_samples": len(demo_samples),
+                "occupancy": occupancy_metadata,
+            }
+            episode_timings.append(episode_record)
+            if on_demo is not None:
+                on_demo(demo_samples, episode_record)
             demo_bar.set_postfix(
                 samples=len(samples),
-                last_s=f"{episode_seconds:.1f}",
-                occ=f"{float(samples[-1].occupancy.mean()):.4f}" if samples else "n/a",
+                last_s=f"{episode_record['seconds']:.1f}",
+                occ=f"{float(demo_samples[-1].occupancy.mean()):.4f}" if demo_samples else "n/a",
             )
 
     if not samples or occupancy_metadata is None:
         raise RuntimeError("No occupancy samples were generated.")
     elapsed = time.perf_counter() - started
     log(
-        f"GT collect done task={hdf5_path.name.removesuffix('_demo.hdf5')!r} "
+        f"GT collect done suite={suite_name} task={hdf5_path.name.removesuffix('_demo.hdf5')!r} "
         f"samples={len(samples)} demos={len({s.demo_key for s in samples})} "
+        f"images_written={images_written} images_reused={images_reused} "
         f"seconds={elapsed:.1f} rate={len(samples) / max(elapsed, 1e-6):.2f} frames/s"
     )
     metadata = {
         "hdf5_path": str(hdf5_path),
+        "suite": suite_name,
+        "task": hdf5_path.name.removesuffix("_demo.hdf5"),
         "num_demos": len({sample.demo_key for sample in samples}),
         "frames_per_demo": frames_per_demo,
         "num_samples": len(samples),
+        "image_root": str(image_root),
+        "images_written": images_written,
+        "images_reused": images_reused,
         "occupancy": occupancy_metadata,
         "episodes": episode_timings,
         "seconds": elapsed,
@@ -461,6 +571,50 @@ def token_position_bins(tokens: np.ndarray, requested_bins: int) -> np.ndarray:
         [tokens[..., edges[i] : edges[i + 1], :].mean(axis=-2) for i in range(effective)],
         axis=-2,
     )
+
+
+def contiguous_token_bins(tokens: np.ndarray, tokens_per_bin: int = 10) -> np.ndarray:
+    """Mean-pool consecutive tokens. Covers the full sequence; last bin may be shorter.
+
+    For PI0.5 LIBERO this is 968/10 -> 97 paligemma bins and 50/10 -> 5 expert bins.
+    """
+    tokens = np.asarray(tokens)
+    if tokens.ndim < 2:
+        raise ValueError(f"Expected [..., tokens, hidden], got {tokens.shape}.")
+    if tokens_per_bin <= 0:
+        raise ValueError("tokens_per_bin must be positive.")
+    length = int(tokens.shape[-2])
+    return np.stack(
+        [
+            tokens[..., start : min(start + tokens_per_bin, length), :].mean(axis=-2)
+            for start in range(0, length, tokens_per_bin)
+        ],
+        axis=-2,
+    )
+
+
+def uniform_euler_flow_times(num_steps: int = 10, count: int = 5) -> tuple[float, ...]:
+    """Pick ``count`` Euler times uniformly from the openpi 10-step loop.
+
+    ``euler_integrate`` uses ``time = 1.0 - step / num_steps`` for ``step in 0..num_steps-1``,
+    i.e. ``1.0, 0.9, ..., 0.1`` when ``num_steps=10``. Default ``count=5`` maps to
+    ``(1.0, 0.8, 0.6, 0.3, 0.1)`` via rounded linspace over those 10 steps.
+    """
+    if num_steps <= 0 or count <= 0:
+        raise ValueError("num_steps and count must be positive.")
+    times = [1.0 - step / float(num_steps) for step in range(num_steps)]
+    if count >= num_steps:
+        return tuple(float(t) for t in times)
+    indices = np.unique(np.round(np.linspace(0, num_steps - 1, count)).astype(int))
+    return tuple(round(float(times[int(i)]), 1) for i in indices)
+
+
+def save_npz_inplace(path: Path, arrays: dict[str, np.ndarray], *, compressed: bool = False) -> None:
+    """Write ``.npz`` through ``wb`` so s3mount does not need rename."""
+    ensure_dir(path.parent)
+    saver = np.savez_compressed if compressed else np.savez
+    with open(path, "wb") as handle:
+        saver(handle, **arrays)
 
 
 def parse_index_spec(spec: str, max_value: int, stride: int = 1) -> list[int]:

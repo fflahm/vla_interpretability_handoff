@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from .utils import paligemma_tokenizer_overrides
+
 
 class ModelWrapper(ABC):
     @abstractmethod
@@ -117,7 +119,10 @@ class Pi05Wrapper(ModelWrapper):
         self.preprocess, self.postprocess = make_pre_post_processors(
             self.policy.config,
             model_id,
-            preprocessor_overrides={"device_processor": {"device": str(self.device_obj)}},
+            preprocessor_overrides={
+                "device_processor": {"device": str(self.device_obj)},
+                **paligemma_tokenizer_overrides(),
+            },
         )
 
     def forward(self, image: np.ndarray, instruction: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -60,6 +61,14 @@ def write_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+
+
+def paligemma_tokenizer_overrides() -> dict[str, dict[str, str]]:
+    """Point LeRobot tokenizer_processor at a local tokenizer when workers are offline."""
+    path = os.environ.get("PALIGEMMA_TOKENIZER")
+    if not path:
+        return {}
+    return {"tokenizer_processor": {"tokenizer_name": path}}
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:

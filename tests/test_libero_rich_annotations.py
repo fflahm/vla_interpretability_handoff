@@ -96,7 +96,7 @@ class RichAnnotationsTest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("RUN_LIBERO_INTEGRATION") == "1", "set RUN_LIBERO_INTEGRATION=1")
     def test_simulator_output_schema(self) -> None:
         dataset = Path(
-            "/home/eai/mars/simulator/LIBERO/libero/libero/datasets/libero_spatial/"
+            "/data/tos/guoshengyu/vla/libero/libero_spatial/"
             "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo.hdf5"
         )
         if not dataset.exists():

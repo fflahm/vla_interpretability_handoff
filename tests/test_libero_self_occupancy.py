@@ -93,6 +93,24 @@ class SelectionAndMetricsTest(unittest.TestCase):
         self.assertEqual(parse_index_spec("0-15:8", 96), [0, 8])
         self.assertEqual(parse_index_spec("0,80,95", 50), [0])
 
+    def test_stable_image_paths_are_keyed_by_demo_and_frame(self) -> None:
+        from pathlib import Path
+
+        from src.libero_self_occupancy import infer_libero_suite, stable_image_paths
+
+        agent, wrist = stable_image_paths(
+            Path("/occ/images"), "libero_10", "KITCHEN_SCENE3_turn_on_the_stove", "demo_7", 19
+        )
+        self.assertEqual(
+            agent.as_posix(),
+            "/occ/images/libero_10/KITCHEN_SCENE3_turn_on_the_stove/demo_7/frame_0019_agentview.png",
+        )
+        self.assertTrue(wrist.name.endswith("_wrist.png"))
+        self.assertEqual(
+            infer_libero_suite(Path("/data/libero/libero_90/foo_demo.hdf5")),
+            "libero_90",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,7 +27,7 @@ from .online_rollout import (
     _to_numpy,
     _unwrap_single_env,
 )
-from .utils import ensure_dir
+from .utils import ensure_dir, paligemma_tokenizer_overrides
 
 
 @dataclass(frozen=True)
@@ -124,6 +124,7 @@ class Pi0LiberoFullTokenRolloutTracer:
             preprocessor_overrides={
                 "device_processor": {"device": str(self.device)},
                 "rename_observations_processor": {"rename_map": rename_map},
+                **paligemma_tokenizer_overrides(),
             },
         )
         env_processor_kwargs = {"env_cfg": self.env_cfg, "policy_cfg": self.policy.config}

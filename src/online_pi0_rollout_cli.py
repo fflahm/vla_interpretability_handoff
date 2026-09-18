@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--video-format", choices=("gif", "mp4"), default=None)
     parser.add_argument("--video-flip-180", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--require-mp4", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-activations", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--rename-map",
         default=None,
@@ -95,6 +96,11 @@ def main() -> None:
             ),
             require_mp4=bool(
                 args.require_mp4 if args.require_mp4 is not None else rollout_cfg.get("require_mp4", True)
+            ),
+            save_activations=bool(
+                args.save_activations
+                if args.save_activations is not None
+                else rollout_cfg.get("save_activations", True)
             ),
         )
     finally:

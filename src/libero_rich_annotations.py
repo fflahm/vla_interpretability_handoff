@@ -7,6 +7,7 @@ It never interprets geometric proximity as MuJoCo contact.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import xml.etree.ElementTree as ET
@@ -22,7 +23,9 @@ from PIL import Image
 ANNOTATION_VERSION = "libero-rich-v1.1"
 DEFAULT_FUTURE_HORIZONS = (1, 4, 8, 16)
 DEFAULT_ACTION_CHUNK = 16
-LOCAL_LIBERO_ROOT = Path("/home/eai/mars/simulator/LIBERO")
+LOCAL_LIBERO_ROOT = Path(
+    os.environ.get("LIBERO_ROOT", "/data/tos/guoshengyu/vla/libero/LIBERO")
+)
 
 
 def native(value: Any) -> Any:
@@ -301,6 +304,33 @@ def _number(text: str | None) -> float | None:
     return float(text) if text is not None else None
 
 
+_LIBERO_PATH_ATTR = re.compile(r'(?:file|meshdir|texturedir)="[^"]+"')
+_LIBERO_OBJECT_ALIAS = re.compile(r'(?<!new_)salad_dressing')
+
+
+def repair_libero_object_names(xml_text: str) -> tuple[str, list[dict[str, str]]]:
+    """Align hdf5 MuJoCo identifiers with objects created from current BDDL.
+
+    LIVING_ROOM_SCENE4 demos name geoms/meshes ``salad_dressing_*``; the BDDL
+    env instantiates ``NewSaladDressing`` and looks up ``new_salad_dressing_*``.
+    Asset ``file=`` / ``meshdir=`` / ``texturedir=`` paths are left unchanged.
+    """
+    replacements: list[dict[str, str]] = []
+    saved_paths: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        saved_paths.append(match.group(0))
+        return f"__LIBERO_PATH_{len(saved_paths) - 1}__"
+
+    protected = _LIBERO_PATH_ATTR.sub(stash, xml_text)
+    rewritten = _LIBERO_OBJECT_ALIAS.sub("new_salad_dressing", protected)
+    if rewritten != protected:
+        replacements.append({"old": "salad_dressing", "new": "new_salad_dressing"})
+    for index, original in enumerate(saved_paths):
+        rewritten = rewritten.replace(f"__LIBERO_PATH_{index}__", original, 1)
+    return rewritten, replacements
+
+
 def repair_asset_paths(
     xml_text: str, assets_root: Path, robosuite_assets_root: Path | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
@@ -320,7 +350,10 @@ def repair_asset_paths(
         new = str(target_root / relative)
         replacements.append({"old": old, "new": new})
         return f'{match.group("prefix")}{new}{match.group("suffix")}'
-    return pattern.sub(replace, xml_text), replacements
+    xml_text = pattern.sub(replace, xml_text)
+    xml_text, name_replacements = repair_libero_object_names(xml_text)
+    replacements.extend(name_replacements)
+    return xml_text, replacements
 
 
 def robosuite_assets_root() -> Path | None:

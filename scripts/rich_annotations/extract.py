@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.libero_rich_annotations import extract_dataset
+from src.libero_rich_annotations import LOCAL_LIBERO_ROOT, extract_dataset
 
 
 def main() -> None:
@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--suite", dest="suites", action="append", default=[],
                         help="Suite directory name to include; repeat for multiple suites.")
     parser.add_argument("--simulator", choices=("auto", "required", "off"), default="auto")
-    parser.add_argument("--libero-root", type=Path, default=Path("/home/eai/mars/simulator/LIBERO"),
+    parser.add_argument("--libero-root", type=Path, default=LOCAL_LIBERO_ROOT,
                         help="LIBERO checkout containing bddl_files and assets.")
     args = parser.parse_args()
     if args.frames_per_demo < 1:

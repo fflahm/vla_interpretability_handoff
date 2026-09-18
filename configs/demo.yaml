@@ -68,3 +68,24 @@ online_pi0:
   output_dir: "outputs/rollouts/pi0_libero_spatial_task1_full_tokens"
   rename_map:
     observation.images.image2: "observation.images.wrist_image"
+
+online_pi05:
+  checkpoint_path: null
+  task: "libero_spatial"
+  task_id: 1
+  instruction: "pick up the black bowl from table center and place it on the plate"
+  num_episodes: 2
+  start_seed: 0
+  max_steps: 250
+  pickup_joint_name: "auto"
+  place_joint_name: "auto"
+  pooling: "mean"
+  rotate_images_180: true
+  save_video: true
+  save_wrist_video: false
+  video_fps: 10
+  video_format: "mp4"
+  video_flip_180: true
+  output_dir: "outputs/rollouts/pi05_libero_spatial_task1"
+  rename_map:
+    observation.images.image2: "observation.images.wrist_image"

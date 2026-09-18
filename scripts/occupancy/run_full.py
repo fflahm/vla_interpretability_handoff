@@ -22,6 +22,7 @@ from src.libero_self_occupancy import (  # noqa: E402
     OccupancyGridSpec, collect_self_occupancy_samples, hard_iou, parse_index_spec,
     soft_iou, stratified_episode_split, write_json, write_jsonl,
 )
+from src.occupancy_decoder import occupancy_bce_dice_loss  # noqa: E402
 from src.pi05_occupancy_full import (  # noqa: E402
     Pi05EulerCapture, list_activation_conditions, load_activation_manifest,
     load_condition_activations, probe_dir, read_jsonl_samples, select_bin_columns,
@@ -34,7 +35,7 @@ def arguments() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=("all", "gt", "activations", "train"), default="all")
     p.add_argument("--dataset-dir", type=Path, required=True)
-    p.add_argument("--pi05-path", default="/home/eai/mars/hub/models/pi05_libero")
+    p.add_argument("--pi05-path", default="/data/tos/guoshengyu/vla/models/pi05_libero")
     p.add_argument("--output-dir", type=Path, default=ROOT / "outputs/self_occupancy/pi05_full")
     p.add_argument("--max-samples", type=int, default=10_000)
     p.add_argument("--max-tasks", type=int, default=10)
@@ -101,6 +102,7 @@ def collect(args: argparse.Namespace, out: Path) -> None:
             hdf5_path=hdf5, output_dir=task_out, num_demos=demos_per_task,
             frames_per_demo=args.max_frames,
             spec=OccupancyGridSpec(size=args.grid_size, supersample=args.supersample),
+            suite=args.dataset_dir.name,
         )
         kept = min(len(samples), args.max_samples - next_id)
         for sample in samples[:kept]:
@@ -136,13 +138,7 @@ def collect(args: argparse.Namespace, out: Path) -> None:
 
 
 def _occupancy_loss(logits, yb, pos_weight):
-    import torch
-    from torch import nn
-
-    prob = logits.sigmoid()
-    dice = 1 - ((2 * (prob * yb).sum(1) + 1e-6) / (prob.sum(1) + yb.sum(1) + 1e-6)).mean()
-    bce = nn.functional.binary_cross_entropy_with_logits(logits, yb, pos_weight=pos_weight)
-    return bce + dice, float((bce + dice).detach().cpu())
+    return occupancy_bce_dice_loss(logits, yb, pos_weight)
 
 
 def _write_history_csv(path: Path, history: list[dict]) -> None:
